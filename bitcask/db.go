@@ -4,7 +4,11 @@ import (
 	"errors"
 	"github.com/qixia1998/GoKVStroge/bitcask/data"
 	"github.com/qixia1998/GoKVStroge/bitcask/index"
+	"io"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -12,6 +16,7 @@ import (
 type DB struct {
 	options    Options
 	mu         *sync.RWMutex
+	fileIds    []int                     // 文件 id，只能在加载索引的时候使用，不能在其他的地方更新和使用
 	activeFile *data.DataFile            // 当前活跃数据文件，可以用于写入
 	olderFiles map[uint32]*data.DataFile // 旧的数据文件，只能用于读
 	index      index.Indexer             // 内存索引
@@ -43,6 +48,12 @@ func Open(options Options) (*DB, error) {
 	if err := db.loadDataFiles(); err != nil {
 		return nil, err
 	}
+
+	// 从数据文件中加载索引
+	if err := db.loadIndexFromDataFiles(); err != nil {
+		return nil, err
+	}
+
 	return db, nil
 }
 
@@ -105,7 +116,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	}
 
 	// 根据偏移量读取对应的数据
-	logRecord, err := dataFile.ReadLogRecord(logRecordPos.Offset)
+	logRecord, _, err := dataFile.ReadLogRecord(logRecordPos.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -184,16 +195,87 @@ func (db *DB) setActivateDataFile() error {
 
 // 从磁盘中加载数据文件
 func (db *DB) loadDataFiles() error {
-	//dirEntries, err := os.ReadDir(db.options.DirPath)
-	//if err != nil {
-	//	return err
-	//}
+	dirEntries, err := os.ReadDir(db.options.DirPath)
+	if err != nil {
+		return err
+	}
 
-	//var fileIds []int
-	//// 遍历目录中的所有文件，找到所有以 .data 结尾的文件
-	//for _, entry := range dirEntries {
-	//	strings.HasSuffix(entry.Name(), data.)
-	//}
+	var fileIds []int
+	// 遍历目录中的所有文件，找到所有以 .data 结尾的文件
+	for _, entry := range dirEntries {
+		if strings.HasSuffix(entry.Name(), data.DataFileNameSuffix) {
+			splitNames := strings.Split(entry.Name(), ".")
+			fileId, err := strconv.Atoi(splitNames[0])
+			// 数据目录有可能被损坏了
+			if err != nil {
+				return ErrDataDirectoryCorrupted
+			}
+			fileIds = append(fileIds, fileId)
+		}
+	}
+	// 对文件 id 进行排序，从小到大依次加载
+	sort.Ints(fileIds)
+
+	// 遍历每个文件id，打开对应的数据文件
+	for i, fid := range fileIds {
+		dataFile, err := data.OpenDataFile(db.options.DirPath, uint32(fid))
+		if err != nil {
+			return err
+		}
+		if i == len(fileIds)-1 { // 最后一个，id是最大的，说明是当前活跃文件
+			db.activeFile = dataFile
+		} else {
+			db.olderFiles[uint32(fid)] = dataFile
+		}
+	}
+	return nil
+}
+
+// 从数据文件中加载索引
+// 遍历文件中的所有记录，并更新到内存索引中
+func (db *DB) loadIndexFromDataFiles() error {
+	// 没有文件，说明数据库是空的，直接返回
+	if len(db.fileIds) == 0 {
+		return nil
+	}
+
+	// 遍历所有的文件id，处理文件中的记录
+	for i, fid := range db.fileIds {
+		var fileId = uint32(fid)
+		var dataFile *data.DataFile
+		if fileId == db.activeFile.FileId {
+			dataFile = db.activeFile
+		} else {
+			dataFile = db.olderFiles[fileId]
+		}
+
+		var offset int64 = 0
+		for {
+			logRecord, size, err := dataFile.ReadLogRecord(offset)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return err
+			}
+
+			// 构造内存索引并保存
+			logRecordPods := &data.LogRecordPos{Fid: fileId, Offset: offset}
+			if logRecord.Type == data.LogRecordDeleted {
+				db.index.Delete(logRecord.Key)
+			} else {
+				db.index.Put(logRecord.Key, logRecordPods)
+			}
+
+			// 递增 offset，下一次从新的位置开始读取
+			offset += size
+		}
+
+		// 如果是当前活跃文件，更新这个文件的 WriteOff
+		if i == len(db.fileIds)-1 {
+			db.activeFile.WriteOff = offset
+		}
+	}
 	return nil
 }
 
